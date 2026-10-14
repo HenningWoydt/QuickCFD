@@ -52,24 +52,25 @@ def cache_dir_for(plt_dir):
     return os.path.join(amr_dir, 'partitions', name)
 
 
-def cache_meta(binary, hierarchy, distance, fps, selected_indices):
+def cache_meta(binary, hierarchy, distance, fps, selected_indices, methods):
     return {
         'binary_hash':       file_sha256(binary),
         'hierarchy':         hierarchy,
         'distance':          distance,
         'fps':               fps,
         'selected_indices':  selected_indices,
+        'methods':           methods,
     }
 
 
 def save_partition_cache(cache_dir, binary, hierarchy, distance, fps,
-                         selected_indices, part_frames):
+                         selected_indices, methods, part_frames):
     """Save per-frame partition lists, timing, and metadata.
 
     part_frames: list of (part_refine, part_always, part_auto, ms_refine, ms_always, ms_auto)
     """
     os.makedirs(cache_dir, exist_ok=True)
-    meta = cache_meta(binary, hierarchy, distance, fps, selected_indices)
+    meta = cache_meta(binary, hierarchy, distance, fps, selected_indices, methods)
     with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
         json.dump(meta, f, indent=2)
     for i, (pr, pa, pu, tr, ta, tu) in enumerate(part_frames):
@@ -85,7 +86,7 @@ def save_partition_cache(cache_dir, binary, hierarchy, distance, fps,
 
 
 def load_partition_cache(cache_dir, binary, hierarchy, distance, fps,
-                         selected_indices):
+                         selected_indices, methods):
     """Return list of (part_refine, part_always, part_auto, ms_r, ms_a, ms_u)
     or None on mismatch."""
     meta_path = os.path.join(cache_dir, 'meta.json')
@@ -93,7 +94,7 @@ def load_partition_cache(cache_dir, binary, hierarchy, distance, fps,
         return None
     with open(meta_path) as f:
         stored = json.load(f)
-    expected = cache_meta(binary, hierarchy, distance, fps, selected_indices)
+    expected = cache_meta(binary, hierarchy, distance, fps, selected_indices, methods)
     if stored != expected:
         return None
     n = len(glob.glob(os.path.join(cache_dir, 'frame_*.npz')))
@@ -548,6 +549,9 @@ def _render_worker(args_tuple):
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
+    _default_binary = os.path.join(
+        os.path.dirname(__file__), '../../extern/amrex/build/Tests/Amr/'
+        'Advection_AmrCore/2d/Test_Amr_Advection_AmrCore_2d')
     parser.add_argument('--plt-dir',    default='.')
     parser.add_argument('--dynheipromap',
                         default='/home/henning/Projects/HeiProMap/build/Dyn-HeiProMap')
@@ -555,14 +559,44 @@ def main():
     parser.add_argument('--distance',   default='1:10')
     parser.add_argument('--save',       default='amrex_compare.mp4')
     parser.add_argument('--fps',        type=int, default=30)
+    parser.add_argument('--amrex-binary', default=_default_binary,
+                        help='AMReX advection binary (for auto-run)')
+    parser.add_argument('--inputs', default=None,
+                        help='AMReX inputs file (auto-detected from --plt-dir name if omitted)')
+    parser.add_argument('--mpirun', default='/usr/bin/mpirun.openmpi')
+    parser.add_argument('--mpi-np', type=int, default=2)
     args = parser.parse_args()
 
     k = 1
     for p in args.hierarchy.split(':'): k *= int(p)
 
-    plotdirs = sorted(glob.glob(os.path.join(args.plt_dir, 'plt?????')))
+    plotdirs = sorted(p for p in glob.glob(os.path.join(args.plt_dir, 'plt*'))
+                      if re.match(r'plt\d+$', os.path.basename(p)))
     if not plotdirs:
-        print(f'No plt##### found in {args.plt_dir}'); return
+        # auto-detect inputs file from plt-dir name
+        inputs = args.inputs
+        if inputs is None:
+            name = os.path.basename(os.path.normpath(args.plt_dir))
+            inputs = os.path.join(os.path.dirname(__file__), '../../amr/inputs', name)
+            inputs = os.path.normpath(inputs)
+        if not os.path.exists(inputs):
+            print(f'No plotfiles in {args.plt_dir} and no inputs file at {inputs}')
+            print('Pass --inputs <file> to specify one.')
+            return
+        binary = os.path.normpath(args.amrex_binary)
+        if not os.path.exists(binary):
+            print(f'AMReX binary not found: {binary}'); return
+        os.makedirs(args.plt_dir, exist_ok=True)
+        print(f'No plotfiles found — running simulation: {os.path.basename(inputs)}')
+        cmd = [args.mpirun, '-n', str(args.mpi_np), binary, inputs]
+        result = subprocess.run(cmd, cwd=os.path.normpath(
+            os.path.join(os.path.dirname(__file__), '../..')))
+        if result.returncode != 0:
+            print('Simulation failed.'); return
+        plotdirs = sorted(p for p in glob.glob(os.path.join(args.plt_dir, 'plt*'))
+                          if re.match(r'plt\d+$', os.path.basename(p)))
+        if not plotdirs:
+            print(f'Simulation ran but no plotfiles found in {args.plt_dir}'); return
 
     # read simulation times
     times = []
@@ -656,10 +690,16 @@ def main():
 
     # ── phase 2: three Dyn-HeiProMap processes (with partition cache) ─────────
 
+    methods = {
+        'refine': {'label': 'refine-fast',        'cmd': 'autorefine 101 fast'},
+        'always': {'label': 'always-repartition', 'cmd': 'partition fast'},
+        'auto':   {'label': 'autorefine-30',      'cmd': 'autorefine 30 fast'},
+    }
+
     cdir = cache_dir_for(args.plt_dir)
     cached = load_partition_cache(cdir, args.dynheipromap,
                                   args.hierarchy, args.distance,
-                                  args.fps, selected_indices)
+                                  args.fps, selected_indices, methods)
 
     if cached is not None:
         print(f'Phase 2: loading cached partitions from {cdir}')
@@ -731,7 +771,7 @@ def main():
         print(f'\n  saving partitions to {cdir}')
         save_partition_cache(cdir, args.dynheipromap,
                              args.hierarchy, args.distance,
-                             args.fps, selected_indices, raw_parts)
+                             args.fps, selected_indices, methods, raw_parts)
 
     # compute stats + build frame list
     prev_map_refine, prev_map_always, prev_map_auto = {}, {}, {}
@@ -825,7 +865,7 @@ def main():
         'frm':   4,  't':    7,  'nd':  5,
         'bal':   5,  'Sco': 8,  'Smi': 7,  'ms':  7,
     }
-    meth = ['refine-fast', 'always-repartition', 'autorefine-30']
+    meth = [methods['refine']['label'], methods['always']['label'], methods['auto']['label']]
     hdr1 = (f"{'frm':>{C['frm']}}  {'t(s)':>{C['t']}}  {'nodes':>{C['nd']}}  "
             + '  '.join(
                 f"{'── ' + m + ' ──':^{C['bal']+C['Sco']+C['Smi']+C['ms']+9}}"
@@ -873,9 +913,9 @@ def main():
     print(s_hdr)
     print(s_sep)
     for label, comm, mig, ms in [
-        ('refine-fast',         cr_f, mr_f, ms_r_tot),
-        ('always-repartition',  ca_f, ma_f, ms_a_tot),
-        ('autorefine-30',       cu_f, mu_f, ms_u_tot),
+        (methods['refine']['label'], cr_f, mr_f, ms_r_tot),
+        (methods['always']['label'], ca_f, ma_f, ms_a_tot),
+        (methods['auto']['label'],   cu_f, mu_f, ms_u_tot),
     ]:
         print(f"  {label:<{sw}}  {table_rows[-1][2]:>{nw}}  {comm:>{cw}}  {mig:>{mw}}  {ms:>{tw}.1f}")
     print(s_sep)

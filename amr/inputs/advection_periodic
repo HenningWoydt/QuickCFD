@@ -2,8 +2,8 @@
 # Run until nsteps == max_step or time == stop_time,
 #     whichever comes first
 # *****************************************************************
-max_step  = 1000
-stop_time = 2.0
+max_step  = 100000
+stop_time = 20.0
 
 # *****************************************************************
 # Are we restarting from an existing checkpoint file?
