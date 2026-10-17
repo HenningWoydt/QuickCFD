@@ -9,6 +9,7 @@ import glob
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import multiprocessing as mp
 
@@ -17,67 +18,10 @@ import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, BoundaryNorm
-from matplotlib.cm import get_cmap
 
-# ── reuse reader from amrex_animate.py ───────────────────────────────────────
-
-def read_fab(filepath, offset, nx, ny):
-    n = nx * ny
-    with open(filepath, 'rb') as f:
-        f.seek(offset)
-        f.readline()  # skip ascii fab header line
-        data = np.frombuffer(f.read(n * 8), dtype='<f8')
-    return data.reshape((ny, nx))
-
-
-def parse_cell_h(cell_h_path):
-    with open(cell_h_path) as f:
-        lines = f.readlines()
-    boxes, fab_entries = [], []
-    i = 0
-    while i < len(lines):
-        m = re.match(r'\((\d+)', lines[i].strip())
-        if m:
-            n = int(m.group(1))
-            for j in range(i+1, i+1+n):
-                bm = re.match(r'\(\((\d+),(\d+)\)\s*\((\d+),(\d+)\)', lines[j].strip())
-                if bm:
-                    boxes.append((int(bm.group(1)), int(bm.group(2)),
-                                  int(bm.group(3)), int(bm.group(4))))
-            i += n + 2
-            break
-        i += 1
-    for line in lines:
-        m = re.match(r'FabOnDisk:\s+(\S+)\s+(\d+)', line.strip())
-        if m:
-            fab_entries.append((m.group(1), int(m.group(2))))
-    return boxes, fab_entries
-
-
-def read_level(plotdir, level):
-    header_path = os.path.join(plotdir, 'Header')
-    cell_h = os.path.join(plotdir, f'Level_{level}', 'Cell_H')
-    level_dir = os.path.join(plotdir, f'Level_{level}')
-    if not os.path.exists(cell_h):
-        return None
-    with open(header_path) as f:
-        hlines = f.readlines()
-    nvar = int(hlines[1].strip())
-    idx = 2 + nvar + 1 + 1 + 1 + 1 + 1 + 1 + 1 + 1  # skip to dx lines
-    dx_line = hlines[idx + level].split()
-    dx, dy = float(dx_line[0]), float(dx_line[1])
-    prob_lo = list(map(float, hlines[2 + nvar + 3].split()))
-    boxes, fab_entries = parse_cell_h(cell_h)
-    all_x1 = max(b[2] for b in boxes) + 1
-    all_y1 = max(b[3] for b in boxes) + 1
-    grid = np.zeros((all_y1, all_x1))
-    for (lo_x, lo_y, hi_x, hi_y), (fname, offset) in zip(boxes, fab_entries):
-        nx = hi_x - lo_x + 1
-        ny = hi_y - lo_y + 1
-        fpath = os.path.join(level_dir, fname)
-        grid[lo_y:hi_y+1, lo_x:hi_x+1] = read_fab(fpath, offset, nx, ny)
-    return grid, prob_lo[0], prob_lo[1], dx, dy
-
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from amrex_common import (read_plotfile, read_time, finest_shape, finest_domain,
+                          select_frames, playback_fps, assemble_video, upsample_to)
 
 # ── build METIS graph from Level 0 grid ──────────────────────────────────────
 
@@ -140,7 +84,7 @@ def _render_worker(args_tuple):
     xmin, xmax, ymin, ymax = cfg['domain']
     k = cfg['k']  # number of partitions
 
-    cmap_part = plt.cm.get_cmap('tab10', k)
+    cmap_part = matplotlib.colormaps['tab10'].resampled(k)
     bounds = np.arange(-0.5, k + 0.5, 1)
     norm_part = BoundaryNorm(bounds, cmap_part.N)
 
@@ -178,21 +122,17 @@ def _render_worker(args_tuple):
     out = []
     for idx in indices:
         fd = frames[idx]
-        src = fd['fine'] if fd['fine'] is not None else fd['coarse']
-        grid, x0, y0, dx, dy = src
-        ny_g, nx_g = grid.shape
-        extent = [x0, x0+nx_g*dx, y0, y0+ny_g*dy]
-        im_phi.set_data(grid)
-        im_phi.set_extent(extent)
+        im_phi.set_data(fd['phi'])
+        im_phi.set_extent([xmin, xmax, ymin, ymax])
 
-        # partition grid: coarsen partition map if fine level shown
         part_grid = fd['partition_grid']
         im_part.set_data(part_grid)
         im_part.set_extent([xmin, xmax, ymin, ymax])
 
         suptitle.set_text(
             f"t = {fd['time']:.4f} s  |  "
-            f"L0: {fd['cells_l0']}  L1: {fd['cells_l1']}  total: {fd['cells_l0']+fd['cells_l1']}"
+            + "  ".join(f"L{lv}: {n}" for lv, n in enumerate(fd['cells']))
+            + f"  total: {sum(fd['cells'])}"
         )
 
         png = cfg['tmpdir'] + f'/f{idx:06d}.png'
@@ -224,11 +164,12 @@ def main():
 
     # ── step 1: read frame 0 to get grid dimensions ──────────────────────────
     print('Reading plt00000 for graph construction...')
-    result0 = read_level(plotdirs[0], 0)
-    if result0 is None:
+    pf0 = read_plotfile(plotdirs[0])
+    if pf0 is None:
         print('Could not read Level_0'); return
-    grid0, x0, y0, dx, dy = result0
-    ny0, nx0 = grid0.shape
+    if pf0['hdr']['ndim'] != 2:
+        print('amrex_map_video.py only supports 2D plotfiles'); return
+    ny0, nx0 = pf0['grids'][0].shape
     print(f'  Level 0 grid: {nx0}×{ny0} = {nx0*ny0} cells')
 
     # ── step 2: build METIS graph ─────────────────────────────────────────────
@@ -276,52 +217,27 @@ def main():
     # ── step 5: load all frames ───────────────────────────────────────────────
     print(f'Found {len(plotdirs)} plotfiles total.')
 
-    times = []
-    for pd in plotdirs:
-        try:
-            with open(os.path.join(pd, 'Header')) as f:
-                hlines = f.readlines()
-            nvar = int(hlines[1].strip())
-            t = float(hlines[2 + nvar + 1].strip())
-            times.append(t)
-        except Exception:
-            times.append(0.0)
-
-    # subsample to target fps
-    t_max = max(times); t_min = min(times)
-    n_target = int((t_max - t_min) * args.fps) + 1
-    if len(plotdirs) > n_target:
-        targets = np.linspace(t_min, t_max, n_target)
-        times_arr = np.array(times)
-        selected = sorted(set(int(np.argmin(np.abs(times_arr - t))) for t in targets))
+    times = [read_time(pd) for pd in plotdirs]
+    selected = select_frames(times, args.fps)
+    if len(selected) < len(plotdirs):
         plotdirs = [plotdirs[i] for i in selected]
         times    = [times[i]    for i in selected]
         print(f'Subsampled to {len(plotdirs)} frames at {args.fps} fps.')
 
     from concurrent.futures import ThreadPoolExecutor
 
+    shape = finest_shape(plotdirs)
+    part_fine = upsample_to(partition, shape)
+
     def _load(args_):
         pd, t, i = args_
-        r0 = read_level(pd, 0)
-        r1 = read_level(pd, 1)
-        if r0 is None:
+        pf = read_plotfile(pd, shape)
+        if pf is None:
             return None
-        g0 = r0[0]
-        g1 = r1[0] if r1 is not None else None
-
-        # build per-frame partition grid at fine resolution if level1 exists
-        if g1 is not None:
-            ny1, nx1 = g1.shape
-            scale = ny1 // ny0
-            part_fine = np.repeat(np.repeat(partition, scale, axis=0), scale, axis=1)
-        else:
-            part_fine = partition
-
         return {
-            'coarse': r0, 'fine': r1,
+            'phi': pf['phi'],
             'partition_grid': part_fine,
-            'cells_l0': g0.size,
-            'cells_l1': g1.size if g1 is not None else 0,
+            'cells': [int((~np.isnan(g)).sum()) for g in pf['grids']],
             'frame': i, 'time': t,
         }
 
@@ -332,8 +248,7 @@ def main():
         load_args = [(pd, t, i) for i, (pd, t) in enumerate(zip(plotdirs, times))]
         for i, fd in enumerate(pool.map(_load, load_args)):
             if fd is not None:
-                src = fd['fine'] if fd['fine'] is not None else fd['coarse']
-                all_phi.append(src[0].ravel())
+                all_phi.append(fd['phi'].ravel())
                 frames.append(fd)
             print(f'\r  {i+1}/{len(plotdirs)}', end='', flush=True)
     print()
@@ -343,7 +258,7 @@ def main():
     phi_max = float(np.percentile(flat, 98))
     phi_max = max(phi_max, phi_min + 1e-6)
 
-    domain = (x0, x0 + nx0*dx, y0, y0 + ny0*dy)
+    domain = finest_domain(pf0["hdr"])
     xmin, xmax, ymin, ymax = domain
 
     render_cfg = {
@@ -355,13 +270,6 @@ def main():
     }
 
     # ── step 6: render ────────────────────────────────────────────────────────
-    import imageio, imageio.v2 as iio2
-
-    ext = os.path.splitext(args.save)[1].lower()
-    extra = {'loop': 0} if ext == '.gif' else {
-        'codec': 'libx264', 'macro_block_size': 1,
-        'output_params': ['-vf', 'crop=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p']}
-
     n = len(frames)
     n_workers = max(1, mp.cpu_count() - 1)
     chunk = max(1, n // n_workers)
@@ -383,9 +291,7 @@ def main():
                 print(f'\r  [{bar}] {pct:3d}%  {done}/{n}', end='', flush=True)
         print()
         print('Assembling...')
-        with imageio.get_writer(args.save, fps=args.fps, **extra) as writer:
-            for i in range(n):
-                writer.append_data(iio2.imread(png_map[i]))
+        assemble_video(tmpdir, args.save, playback_fps(times, args.fps))
     print(f'Saved → {args.save}')
 
 

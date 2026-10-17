@@ -21,200 +21,21 @@ Usage:
 import argparse
 import glob
 import os
-import re
+import sys
 
 import numpy as np
 
-
-# ── AMReX readers ────────────────────────────────────────────────────────────
-
-def parse_cell_h(cell_h_path):
-    with open(cell_h_path) as f:
-        lines = f.readlines()
-    boxes, fab_entries = [], []
-    i = 0
-    while i < len(lines):
-        m = re.match(r'\((\d+)', lines[i].strip())
-        if m:
-            n = int(m.group(1))
-            for j in range(i + 1, i + 1 + n):
-                bm = re.match(r'\(\((\d+),(\d+)\)\s*\((\d+),(\d+)\)', lines[j].strip())
-                if bm:
-                    boxes.append((int(bm.group(1)), int(bm.group(2)),
-                                  int(bm.group(3)), int(bm.group(4))))
-            i += n + 2
-            break
-        i += 1
-    for line in lines:
-        m = re.match(r'FabOnDisk:\s+(\S+)\s+(\d+)', line.strip())
-        if m:
-            fab_entries.append((m.group(1), int(m.group(2))))
-    return boxes, fab_entries
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from amrex_common import (read_plotfile, finest_shape, build_composite_graph,
+                          nodes_edges_to_metis)
 
 
-def read_l1_mask(plotdir, nx0, ny0):
-    """Return bool mask (ny0, nx0): True where an L1 box covers the L0 cell."""
-    cell_h = os.path.join(plotdir, 'Level_1', 'Cell_H')
-    if not os.path.exists(cell_h):
-        return np.zeros((ny0, nx0), dtype=bool)
-    boxes, _ = parse_cell_h(cell_h)
-    mask = np.zeros((ny0, nx0), dtype=bool)
-    for (lo_x, lo_y, hi_x, hi_y) in boxes:
-        r0_lo, c0_lo = lo_y // 2, lo_x // 2
-        r0_hi, c0_hi = hi_y // 2, hi_x // 2
-        mask[r0_lo:r0_hi + 1, c0_lo:c0_hi + 1] = True
-    return mask
-
-
-def read_header_dims(plotdir):
-    """Return (nx0, ny0) from the Level_0 domain box in the Header."""
-    with open(os.path.join(plotdir, 'Header')) as f:
-        hlines = f.readlines()
-    nvar = int(hlines[1].strip())
-    # layout: [0]=version [1]=nvar [2..2+nvar-1]=varnames [2+nvar]=spacedim
-    # [2+nvar+1]=time [2+nvar+2]=max_level [2+nvar+3]=prob_lo
-    # [2+nvar+4]=prob_hi [2+nvar+5]=ref_ratios [2+nvar+6]=domains
-    idx = 2 + nvar + 6
-    domains_line = hlines[idx].strip()
-    m = re.match(r'\(\((\d+),(\d+)\)\s*\((\d+),(\d+)\)', domains_line)
-    if not m:
-        raise ValueError(f"Cannot parse domains line: {domains_line!r}")
-    nx0 = int(m.group(3)) + 1
-    ny0 = int(m.group(4)) + 1
-    return nx0, ny0
-
-
-# ── composite graph builder ──────────────────────────────────────────────────
-
-def build_composite_nodes_edges(nx0, ny0, l1_mask, periodic=True):
-    """
-    Returns:
-      nodes: list of (level, r, c)  – ordered by node id (0-indexed)
-      edges: set of frozenset({u, v})
-      l0_node: dict (r, c) -> node_id  for L0 uncovered cells
-      l1_node: dict (r1, c1) -> node_id  for L1 fine cells
-    """
-    nx1, ny1 = nx0 * 2, ny0 * 2
-
-    l0_node = {}
-    nodes = []
-    for r in range(ny0):
-        for c in range(nx0):
-            if not l1_mask[r, c]:
-                l0_node[(r, c)] = len(nodes)
-                nodes.append((0, r, c))
-
-    l1_node = {}
-    for r0 in range(ny0):
-        for c0 in range(nx0):
-            if l1_mask[r0, c0]:
-                for dr in range(2):
-                    for dc in range(2):
-                        r1, c1 = r0 * 2 + dr, c0 * 2 + dc
-                        l1_node[(r1, c1)] = len(nodes)
-                        nodes.append((1, r1, c1))
-
-    def l0_nb(r, c, dr, dc):
-        rn = (r + dr) % ny0 if periodic else r + dr
-        cn = (c + dc) % nx0 if periodic else c + dc
-        if not periodic and (rn < 0 or rn >= ny0 or cn < 0 or cn >= nx0):
-            return -1
-        if l1_mask[rn, cn]:
-            return -1
-        return l0_node.get((rn, cn), -1)
-
-    def l0_l1_boundary(r0, c0, dr, dc):
-        rn = (r0 + dr) % ny0 if periodic else r0 + dr
-        cn = (c0 + dc) % nx0 if periodic else c0 + dc
-        if not periodic and (rn < 0 or rn >= ny0 or cn < 0 or cn >= nx0):
-            return []
-        if not l1_mask[rn, cn]:
-            return []
-        r1n, c1n = rn * 2, cn * 2
-        if dr != 0:
-            return [l1_node.get((r1n + (0 if dr == 1 else 1), c1n + d), -1) for d in range(2)]
-        else:
-            return [l1_node.get((r1n + d, c1n + (0 if dc == 1 else 1)), -1) for d in range(2)]
-
-    def l1_nb(r1, c1, dr, dc):
-        rn, cn = r1 + dr, c1 + dc
-        if periodic:
-            rn = rn % ny1; cn = cn % nx1
-        else:
-            if rn < 0 or rn >= ny1 or cn < 0 or cn >= nx1:
-                return -1
-        nb = l1_node.get((rn, cn), -1)
-        if nb >= 0:
-            return nb
-        r0n, c0n = rn // 2, cn // 2
-        if periodic:
-            r0n = r0n % ny0; c0n = c0n % nx0
-        return l0_node.get((r0n, c0n), -1)
-
-    edges = set()
-    for node_id, (level, r, c) in enumerate(nodes):
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            if level == 0:
-                nb = l0_nb(r, c, dr, dc)
-                if nb >= 0:
-                    edges.add(frozenset((node_id, nb)))
-                for nb2 in l0_l1_boundary(r, c, dr, dc):
-                    if nb2 >= 0:
-                        edges.add(frozenset((node_id, nb2)))
-            else:
-                nb = l1_nb(r, c, dr, dc)
-                if nb >= 0:
-                    edges.add(frozenset((node_id, nb)))
-
-    return nodes, edges, l0_node, l1_node
-
-
-def nodes_edges_to_metis(nodes, edges):
-    """Produce METIS fmt=011 lines (vertex weight=1, edge weight=1)."""
-    N = len(nodes)
-    adj = [[] for _ in range(N)]
-    for e in edges:
-        u, v = tuple(e)
-        adj[u].append(v)
-        adj[v].append(u)
-    M = len(edges)
-    lines = [f"{N} {M} 011\n"]
-    for nbs in adj:
-        parts = ["1"] + [f"{nb + 1} 1" for nb in nbs]
-        lines.append(" ".join(parts) + "\n")
-    return lines
-
-
-# ── node id maps that survive across frames ──────────────────────────────────
-
-def cell_key(level, r, c):
-    """A stable string id for a cell, used as Dyn-HeiProMap vertex id."""
-    return f"{level}_{r}_{c}"
-
+# ── stable ids ───────────────────────────────────────────────────────────────
 
 def build_cell_id_map(nodes):
-    """Return dict cell_key -> stable integer id.
-
-    We assign ids based on a fixed scheme so ids are consistent across frames:
-      L0 cell (r, c) on a 64x64 grid: id = r*64 + c  (0..4095)
-      L1 cell (r1, c1) on 128x128 grid: id = 4096 + r1*128 + c1  (4096..20480)
-    This keeps ids stable regardless of which cells are active.
-    """
-    id_map = {}
-    for (level, r, c) in nodes:
-        if level == 0:
-            vid = r * 128 + c  # use 128 as stride to not overlap with L1 ids... actually simpler:
-        else:
-            pass
-    # Actually compute from node index in a stable way via the formula above
-    id_map = {}
-    for (level, r, c) in nodes:
-        if level == 0:
-            vid = c + r * 10000          # L0: up to 64*64=4096, stride 10000
-        else:
-            vid = 100000 + c + r * 10000  # L1: offset by 100000
-        id_map[(level, r, c)] = vid
-    return id_map
+    """Return dict (level, r, c) -> stable integer id, independent of which
+    cells are active in a given frame (stride 10000 per row, 10**7 per level)."""
+    return {(lv, r, c): lv * 10_000_000 + r * 10_000 + c for (lv, r, c) in nodes}
 
 
 # ── diff between two frames ──────────────────────────────────────────────────
@@ -290,8 +111,8 @@ def main():
     os.makedirs(args.out_dir, exist_ok=True)
 
     # determine grid dimensions from first frame
-    nx0, ny0 = read_header_dims(plotdirs[0])
-    print(f'L0 grid: {nx0} x {ny0}')
+    shape = finest_shape(plotdirs)
+    print(f'finest-level image: {shape[1]} x {shape[0]}')
 
     prev_nodes = None
     prev_edges = None
@@ -300,8 +121,8 @@ def main():
     for i, pd in enumerate(plotdirs):
         print(f'\r  frame {i+1}/{len(plotdirs)}  ({os.path.basename(pd)})', end='', flush=True)
 
-        l1_mask = read_l1_mask(pd, nx0, ny0)
-        nodes, edges, l0_node, l1_node = build_composite_nodes_edges(nx0, ny0, l1_mask)
+        pf = read_plotfile(pd, shape)
+        nodes, edges, _ = build_composite_graph(pf['grids'], pf['hdr']['ratios'], shape=shape)
         id_map = build_cell_id_map(nodes)
 
         seq_path = os.path.join(args.out_dir, f'frame_{i:06d}.my_seq')

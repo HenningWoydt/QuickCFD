@@ -1,0 +1,36 @@
+# Constant translation (U, V) = (0.5, 0.25) across the periodic box
+# Blob at (0.5, 0.75) crosses partition boundaries at steady speed
+max_step  = 10000
+stop_time = 20.0
+
+geometry.prob_lo     =  0.0  0.0  0.0
+geometry.prob_hi     =  1.0  1.0  0.125
+geometry.is_periodic =  1    1    1
+
+amr.v              = 1
+
+amr.n_cell          = 64 64 8
+amr.max_level       = 2
+amr.ref_ratio       = 2 2 2 2
+
+amr.blocking_factor_x = 8
+amr.blocking_factor_y = 8
+amr.blocking_factor_z = 8
+
+amr.max_grid_size   = 16
+amr.regrid_int      = 2
+
+adv.cfl            = 0.7
+adv.velocity_type  = 6       # 0 deformational, 1 rotating, 2 vortex, 3 shear, 4 vortex pair, 5 cellular, 6 translation
+adv.do_subcycle    = 1
+adv.do_reflux = 1
+
+adv.phierr = 1.01  1.1  1.5
+
+amr.plot_file  = amr/plotfiles/advection_translation/plt
+amr.plot_int   = 1
+
+amr.chk_file = chk
+amr.chk_int  = -1
+
+amr.do_tracers = 0

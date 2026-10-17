@@ -10,7 +10,7 @@ geometry.is_periodic =  1    1    1
 amr.v              = 1
 
 amr.n_cell          = 64 64 8
-amr.max_level       = 1
+amr.max_level       = 2
 amr.ref_ratio       = 2 2 2 2
 
 amr.blocking_factor_x = 8
@@ -21,10 +21,11 @@ amr.max_grid_size   = 16
 amr.regrid_int      = 2
 
 adv.cfl            = 0.7
+adv.velocity_type  = 2       # 0 deformational, 1 rotating, 2 vortex
 adv.do_subcycle    = 1
 adv.do_reflux = 1
 
-adv.phierr = 1.01  1.1
+adv.phierr = 1.01  1.1  1.5
 
 amr.plot_file  = amr/plotfiles/advection_vortex/plt
 amr.plot_int   = 1

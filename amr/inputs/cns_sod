@@ -1,0 +1,43 @@
+# Sod shock tube (compressible Euler, GPU/CNS test) in a thin 3D slab, periodic in y and z.
+# Shock, contact and rarefaction travel along x, so the refined region is a few thin planes.
+max_step  = 100000
+stop_time = 20.0
+
+geometry.is_periodic = 0 1 1
+geometry.coord_sys   = 0
+geometry.prob_lo     =   0.0     0.0     0.0
+geometry.prob_hi     =   1.0     0.125   0.125
+amr.n_cell           =   64      8       8
+
+cns.lo_bc       =  2   0   0
+cns.hi_bc       =  2   0   0
+cns.cfl = 0.3
+cns.do_visc = false
+
+cns.refine_max_dengrad_lev = 10
+cns.refine_dengrad = 0.02
+
+cns.v = 1
+amr.v = 1
+
+amr.max_level       = 2
+amr.ref_ratio       = 2 2 2 2
+amr.regrid_int      = 2 2 2 2
+amr.blocking_factor = 4
+amr.max_grid_size   = 32
+amr.n_error_buf     = 1 1 1 1
+amr.grid_eff        = 0.7
+
+amr.checkpoint_files_output = 0
+
+amr.plot_files_output = 1
+amr.plot_file         = amr/plotfiles/cns_sod/plt
+amr.plot_int          = 50      # about 190 plotfiles over the run
+amr.derive_plot_vars  = pressure
+
+prob.p_l   = 1.0
+prob.p_r   = 0.1
+prob.rho_l = 1.0
+prob.rho_r = 0.125
+prob.u_l   = 0.0
+prob.u_r   = 0.0

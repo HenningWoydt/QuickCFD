@@ -6,6 +6,9 @@
   bottom-left always repartition (Dyn-HeiProMap, partition fast every frame)
   bottom-right autorefine 30   (Dyn-HeiProMap, autorefine 30 every frame)
 
+With --render3d (3D plotfiles) each panel is a 3D view: density isosurfaces, coloured
+by value in the field panel and by rank in the three partition panels.
+
 Usage:
   python3 amrex_dynmap_video.py \\
       --plt-dir amr/plotfiles/advection_periodic \\
@@ -25,12 +28,21 @@ import tempfile
 import threading
 import time
 import multiprocessing as mp
+import sys
 
 import numpy as np
+# offscreen 3D rendering (--render3d) goes through EGL; harmless otherwise
+os.environ.setdefault('VTK_DEFAULT_OPENGL_WINDOW', 'vtkEGLRenderWindow')
+
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 from matplotlib.colors import Normalize, BoundaryNorm
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from amrex_common import (GRAPH_VERSION, read_plotfile, read_time, finest_shape,
+                          finest_domain, build_composite_graph, partition_image, slice_2d,
+                          select_frames, playback_fps, assemble_video, var_index)
 
 
 # ── partition cache ───────────────────────────────────────────────────────────
@@ -52,231 +64,75 @@ def cache_dir_for(plt_dir):
     return os.path.join(amr_dir, 'partitions', name)
 
 
-def cache_meta(binary, hierarchy, distance, fps, selected_indices, methods):
+def cache_meta(binary, hierarchy, distance, methods, n_plotfiles):
     return {
-        'binary_hash':       file_sha256(binary),
-        'hierarchy':         hierarchy,
-        'distance':          distance,
-        'fps':               fps,
-        'selected_indices':  selected_indices,
-        'methods':           methods,
+        'binary_hash':   file_sha256(binary),
+        'hierarchy':     hierarchy,
+        'distance':      distance,
+        'methods':       methods,
+        'n_plotfiles':   n_plotfiles,
+        'graph_version': GRAPH_VERSION,
     }
 
 
-def save_partition_cache(cache_dir, binary, hierarchy, distance, fps,
-                         selected_indices, methods, part_frames):
-    """Save per-frame partition lists, timing, and metadata.
-
-    part_frames: list of (part_refine, part_always, part_auto, ms_refine, ms_always, ms_auto)
-    """
-    os.makedirs(cache_dir, exist_ok=True)
-    meta = cache_meta(binary, hierarchy, distance, fps, selected_indices, methods)
-    with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
-        json.dump(meta, f, indent=2)
-    for i, (pr, pa, pu, tr, ta, tu) in enumerate(part_frames):
-        np.savez_compressed(
-            os.path.join(cache_dir, f'frame_{i:06d}.npz'),
-            refine=np.array(pr, dtype=np.int32),
-            always=np.array(pa, dtype=np.int32),
-            auto=np.array(pu,   dtype=np.int32),
-            ms_refine=np.float32(tr),
-            ms_always=np.float32(ta),
-            ms_auto=np.float32(tu),
-        )
+# One file per plotfile (every plotfile, not only the frames shown in the video):
+#   refine / always / auto  rank of every node for the three strategies
+#   nodes                   (level, *index) of every node, in the same order
+#   time                    simulation time
+#   ms_refine / ms_always / ms_auto   partitioning time of each strategy
+def frame_path(cache_dir, i):
+    return os.path.join(cache_dir, f'frame_{i:06d}.npz')
 
 
-def load_partition_cache(cache_dir, binary, hierarchy, distance, fps,
-                         selected_indices, methods):
-    """Return list of (part_refine, part_always, part_auto, ms_r, ms_a, ms_u)
-    or None on mismatch."""
+def cache_is_valid(cache_dir, meta):
     meta_path = os.path.join(cache_dir, 'meta.json')
     if not os.path.exists(meta_path):
-        return None
+        return False
     with open(meta_path) as f:
-        stored = json.load(f)
-    expected = cache_meta(binary, hierarchy, distance, fps, selected_indices, methods)
-    if stored != expected:
-        return None
-    n = len(glob.glob(os.path.join(cache_dir, 'frame_*.npz')))
-    if n != len(selected_indices):
-        return None
-    result = []
-    for i in range(n):
-        d = np.load(os.path.join(cache_dir, f'frame_{i:06d}.npz'))
-        result.append((
-            d['refine'].tolist(), d['always'].tolist(), d['auto'].tolist(),
-            float(d['ms_refine']), float(d['ms_always']), float(d['ms_auto']),
-        ))
-    return result
+        if json.load(f) != meta:
+            return False
+    return len(glob.glob(os.path.join(cache_dir, 'frame_*.npz'))) == meta['n_plotfiles']
 
 
-# ── AMReX readers ─────────────────────────────────────────────────────────────
-
-def parse_cell_h(cell_h_path):
-    with open(cell_h_path) as f:
-        lines = f.readlines()
-    boxes, fab_entries = [], []
-    i = 0
-    while i < len(lines):
-        m = re.match(r'\((\d+)', lines[i].strip())
-        if m:
-            n = int(m.group(1))
-            for j in range(i + 1, i + 1 + n):
-                bm = re.match(r'\(\((\d+),(\d+)\)\s*\((\d+),(\d+)\)', lines[j].strip())
-                if bm:
-                    boxes.append((int(bm.group(1)), int(bm.group(2)),
-                                  int(bm.group(3)), int(bm.group(4))))
-            i += n + 2
-            break
-        i += 1
-    for line in lines:
-        m = re.match(r'FabOnDisk:\s+(\S+)\s+(\d+)', line.strip())
-        if m:
-            fab_entries.append((m.group(1), int(m.group(2))))
-    return boxes, fab_entries
+def reset_cache(cache_dir):
+    """Remove a stale or partial cache before recomputing it."""
+    os.makedirs(cache_dir, exist_ok=True)
+    for p in glob.glob(os.path.join(cache_dir, 'frame_*.npz')) + \
+             [os.path.join(cache_dir, 'meta.json')]:
+        if os.path.exists(p):
+            os.remove(p)
 
 
-def read_fab(filepath, offset, nx, ny):
-    with open(filepath, 'rb') as f:
-        f.seek(offset)
-        f.readline()
-        data = np.frombuffer(f.read(nx * ny * 8), dtype='<f8')
-    return data.reshape((ny, nx))
+def save_frame(cache_dir, i, parts, ms, nodes, t):
+    np.savez_compressed(
+        frame_path(cache_dir, i),
+        refine=np.array(parts[0], dtype=np.int32),
+        always=np.array(parts[1], dtype=np.int32),
+        auto=np.array(parts[2], dtype=np.int32),
+        ms_refine=np.float32(ms[0]),
+        ms_always=np.float32(ms[1]),
+        ms_auto=np.float32(ms[2]),
+        nodes=np.array(nodes, dtype=np.int32),
+        time=np.float64(t),
+    )
 
 
-def read_level_raw(plotdir, level):
-    """Return (grid, boxes, x0, y0, dx, dy) or None."""
-    cell_h = os.path.join(plotdir, f'Level_{level}', 'Cell_H')
-    level_dir = os.path.join(plotdir, f'Level_{level}')
-    header_path = os.path.join(plotdir, 'Header')
-    if not os.path.exists(cell_h):
-        return None
-    with open(header_path) as f:
-        hlines = f.readlines()
-    nvar = int(hlines[1].strip())
-    # [0]=version [1]=nvar [2..nvar+1]=varnames [nvar+2]=spacedim [nvar+3]=time
-    # [nvar+4]=max_level [nvar+5]=prob_lo [nvar+6]=prob_hi [nvar+7]=ref_ratios
-    # [nvar+8]=domains [nvar+9]=stepping  [nvar+10+level]=dx
-    base = 2 + nvar
-    prob_lo = list(map(float, hlines[base + 3].split()))
-    dx_line = hlines[base + 8 + level].split()
-    dx, dy = float(dx_line[0]), float(dx_line[1])
-    boxes, fab_entries = parse_cell_h(cell_h)
-    all_x1 = max(b[2] for b in boxes) + 1
-    all_y1 = max(b[3] for b in boxes) + 1
-    grid = np.zeros((all_y1, all_x1))
-    for (lo_x, lo_y, hi_x, hi_y), (fname, offset) in zip(boxes, fab_entries):
-        nx_ = hi_x - lo_x + 1
-        ny_ = hi_y - lo_y + 1
-        grid[lo_y:hi_y + 1, lo_x:hi_x + 1] = read_fab(
-            os.path.join(level_dir, fname), offset, nx_, ny_)
-    return grid, boxes, prob_lo[0], prob_lo[1], dx, dy
+def load_frame(cache_dir, i):
+    d = np.load(frame_path(cache_dir, i))
+    parts = (d['refine'].tolist(), d['always'].tolist(), d['auto'].tolist())
+    ms = (float(d['ms_refine']), float(d['ms_always']), float(d['ms_auto']))
+    return parts, ms
 
 
-# ── composite graph ────────────────────────────────────────────────────────────
-
-def build_composite_graph(nx0, ny0, l1_mask, periodic=True):
-    """Return (metis_lines, nodes, edges, l0_node, l1_node)."""
-    nx1, ny1 = nx0 * 2, ny0 * 2
-    l0_node = {}
-    nodes = []
-    for r in range(ny0):
-        for c in range(nx0):
-            if not l1_mask[r, c]:
-                l0_node[(r, c)] = len(nodes)
-                nodes.append((0, r, c))
-    l1_node = {}
-    for r0 in range(ny0):
-        for c0 in range(nx0):
-            if l1_mask[r0, c0]:
-                for dr in range(2):
-                    for dc in range(2):
-                        r1, c1 = r0 * 2 + dr, c0 * 2 + dc
-                        l1_node[(r1, c1)] = len(nodes)
-                        nodes.append((1, r1, c1))
-
-    def l0_nb(r, c, dr, dc):
-        rn = (r + dr) % ny0 if periodic else r + dr
-        cn = (c + dc) % nx0 if periodic else c + dc
-        if not periodic and (rn < 0 or rn >= ny0 or cn < 0 or cn >= nx0):
-            return -1
-        if l1_mask[rn, cn]:
-            return -1
-        return l0_node.get((rn, cn), -1)
-
-    def l0_l1_boundary(r0, c0, dr, dc):
-        rn = (r0 + dr) % ny0 if periodic else r0 + dr
-        cn = (c0 + dc) % nx0 if periodic else c0 + dc
-        if not periodic and (rn < 0 or rn >= ny0 or cn < 0 or cn >= nx0):
-            return []
-        if not l1_mask[rn, cn]:
-            return []
-        r1n, c1n = rn * 2, cn * 2
-        if dr != 0:
-            return [l1_node.get((r1n + (0 if dr == 1 else 1), c1n + d), -1) for d in range(2)]
-        else:
-            return [l1_node.get((r1n + d, c1n + (0 if dc == 1 else 1)), -1) for d in range(2)]
-
-    def l1_nb(r1, c1, dr, dc):
-        rn, cn = r1 + dr, c1 + dc
-        if periodic:
-            rn = rn % ny1; cn = cn % nx1
-        else:
-            if rn < 0 or rn >= ny1 or cn < 0 or cn >= nx1:
-                return -1
-        nb = l1_node.get((rn, cn), -1)
-        if nb >= 0:
-            return nb
-        r0n, c0n = rn // 2, cn // 2
-        if periodic:
-            r0n = r0n % ny0; c0n = c0n % nx0
-        return l0_node.get((r0n, c0n), -1)
-
-    edges = set()
-    adj = [[] for _ in range(len(nodes))]
-
-    def add_edge(u, v):
-        if u < 0 or v < 0 or u == v:
-            return
-        key = (min(u, v), max(u, v))
-        if key not in edges:
-            edges.add(key)
-            adj[u].append(v)
-            adj[v].append(u)
-
-    for nid, (level, r, c) in enumerate(nodes):
-        for dr, dc in [(-1, 0), (1, 0), (0, -1), (0, 1)]:
-            if level == 0:
-                add_edge(nid, l0_nb(r, c, dr, dc))
-                for nb2 in l0_l1_boundary(r, c, dr, dc):
-                    add_edge(nid, nb2)
-            else:
-                add_edge(nid, l1_nb(r, c, dr, dc))
-
-    N = len(nodes)
-    M = len(edges)
-    lines = [f"{N} {M} 011\n"]
-    for nbs in adj:
-        lines.append("1 " + " ".join(f"{nb + 1} 1" for nb in nbs) + "\n")
-
-    return lines, nodes, edges, l0_node, l1_node
+def finish_cache(cache_dir, meta):
+    """Mark the cache complete (written last, so a partial cache is never valid)."""
+    with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
+        json.dump(meta, f, indent=2)
 
 
-def cell_key(level, r, c):
-    """Hashable cell identity, used as dict key."""
-    return (level, r, c)
-
-
-def partition_image(nodes, partition, ny0, nx0):
-    """Build (ny0*2, nx0*2) partition image from node list + partition list."""
-    img = np.full((ny0 * 2, nx0 * 2), -1, dtype=np.int32)
-    for nid, (level, r, c) in enumerate(nodes):
-        p = partition[nid]
-        if level == 0:
-            img[r * 2:(r + 1) * 2, c * 2:(c + 1) * 2] = p
-        else:
-            img[r, c] = p
-    return img
+def cell_key(*cell):
+    """Hashable cell identity (level, *index), used as dict key."""
+    return tuple(cell)
 
 
 def partition_stats(nodes, edges, partition, k, prev_part_map):
@@ -348,8 +204,8 @@ class DynHeiProMap:
         """Load initial graph via exec file. Assigns IDs 0..N-1 in node order."""
         seq_path = os.path.join(self._tmpdir, 'init.my_seq')
         with open(seq_path, 'w') as f:
-            for i, (lv, r, c) in enumerate(nodes):
-                self._cell_to_id[cell_key(lv, r, c)] = i
+            for i, cell in enumerate(nodes):
+                self._cell_to_id[cell_key(*cell)] = i
                 self._next_id = i + 1
                 f.write(f'+v {i} 1\n')
             for u, v in edges:
@@ -459,7 +315,7 @@ def _render_worker(args_tuple):
     fig.patch.set_facecolor('#1a1a2e')
 
     titles = [
-        'phi field',
+        f"{cfg['var']} field",
         f'refine-fast (Dyn-HeiProMap, k={k})',
         f'always repartition (Dyn-HeiProMap, k={k})',
         f'autorefine 30 (Dyn-HeiProMap, k={k})',
@@ -488,7 +344,7 @@ def _render_worker(args_tuple):
                                norm=norm_part, extent=[xmin, xmax, ymin, ymax],
                                interpolation='nearest')
 
-    fig.colorbar(im_phi,    ax=ax_phi,    fraction=0.046, pad=0.04).set_label('phi',  color='white', fontsize=7)
+    fig.colorbar(im_phi,    ax=ax_phi,    fraction=0.046, pad=0.04).set_label(cfg['var'], color='white', fontsize=7)
     fig.colorbar(im_static, ax=ax_static, fraction=0.046, pad=0.04).set_label('rank', color='white', fontsize=7)
     fig.colorbar(im_always, ax=ax_always, fraction=0.046, pad=0.04).set_label('rank', color='white', fontsize=7)
     fig.colorbar(im_auto,   ax=ax_auto,   fraction=0.046, pad=0.04).set_label('rank', color='white', fontsize=7)
@@ -512,11 +368,8 @@ def _render_worker(args_tuple):
     for idx in indices:
         fd = frames[idx]
         # phi
-        src = fd['fine'] if fd['fine'] is not None else fd['coarse']
-        g, x0, y0, dx, dy = src
-        ny_g, nx_g = g.shape
-        im_phi.set_data(g)
-        im_phi.set_extent([x0, x0 + nx_g * dx, y0, y0 + ny_g * dy])
+        im_phi.set_data(fd['phi'])
+        im_phi.set_extent([xmin, xmax, ymin, ymax])
         # partitions
         im_static.set_data(fd['part_refine'])
         im_always.set_data(fd['part_always'])
@@ -533,7 +386,8 @@ def _render_worker(args_tuple):
 
         suptitle.set_text(
             f"t = {fd['time']:.4f} s  |  "
-            f"nodes: {fd['n_nodes']}  (L0: {fd['n_l0']}  L1: {fd['n_l1']})"
+            f"nodes: {fd['n_nodes']}  ("
+            + "  ".join(f"L{lv}: {n}" for lv, n in enumerate(fd['n_per_level'])) + ")"
         )
         png = cfg['tmpdir'] + f'/f{idx:06d}.png'
         fig.savefig(png, dpi=cfg['dpi'], facecolor=fig.get_facecolor(),
@@ -544,7 +398,79 @@ def _render_worker(args_tuple):
     return out
 
 
-# ── main ──────────────────────────────────────────────────────────────────────
+def _render_worker_3d(args_tuple):
+    """3D version of the render worker: isosurfaces of the field, coloured by
+    value (top-left) or by the rank of the leaf cell each surface point is in."""
+    indices, frames, cfg = args_tuple
+    import numpy as np
+    import pyvista as pv
+    pv.OFF_SCREEN = True
+
+    k = cfg['k']
+    lo, hi = cfg['domain3d']
+    shape_xyz = cfg['shape3d'][::-1]
+    spacing = tuple((h - l) / n for l, h, n in zip(lo, hi, shape_xyz))
+    levels = np.linspace(cfg['phi_min'], cfg['phi_max'], 5)[1:-1]
+    cmap_part = matplotlib.colormaps.get_cmap('tab10').resampled(k)
+
+    titles = [f"{cfg['var']} isosurfaces",
+              f'refine-fast (Dyn-HeiProMap, k={k})',
+              f'always repartition (Dyn-HeiProMap, k={k})',
+              f'autorefine 30 (Dyn-HeiProMap, k={k})']
+    pl = pv.Plotter(shape=(2, 2), off_screen=True, window_size=cfg['win3d'])
+    pl.set_background('#1a1a2e')
+    pl.link_views()
+
+    out = []
+    first = True
+    for idx in indices:
+        fd = frames[idx]
+        grid = pv.ImageData(dimensions=tuple(n + 1 for n in shape_xyz),
+                            origin=lo, spacing=spacing)
+        grid.cell_data['v'] = fd['vol'].ravel()
+        iso = grid.cell_data_to_point_data().contour(levels, scalars='v')
+
+        # voxel under each surface point -> rank of the leaf cell there
+        if iso.n_points:
+            ijk = np.floor((iso.points - np.array(lo)) / np.array(spacing)).astype(int)
+            ijk = np.clip(ijk, 0, np.array(shape_xyz) - 1)
+
+        pl.clear_actors()  # clears every sub-plot
+        for p, (r, c) in enumerate([(0, 0), (0, 1), (1, 0), (1, 1)]):
+            pl.subplot(r, c)
+            pl.add_mesh(grid.outline(), color='#888888')
+            if iso.n_points:
+                if p == 0:
+                    pl.add_mesh(iso, scalars='v', cmap='RdYlBu_r', opacity=0.75,
+                                clim=(cfg['phi_min'], cfg['phi_max']),
+                                scalar_bar_args={'title': cfg['var'], 'color': 'white',
+                                                 'n_labels': 4, 'height': 0.3,
+                                                 'position_x': 0.88, 'position_y': 0.3,
+                                                 'vertical': True})
+                else:
+                    key = ('refine', 'always', 'auto')[p - 1]
+                    iso.point_data['rank'] = fd[f'part3d_{key}'][ijk[:, 2], ijk[:, 1], ijk[:, 0]]
+                    pl.add_mesh(iso, scalars='rank', cmap=cmap_part, clim=(-0.5, k - 0.5),
+                                show_scalar_bar=False, opacity=0.9)
+            pl.add_text(titles[p], position='upper_edge', font_size=8, color='white')
+            if p == 0:
+                pl.add_text(f"t = {fd['time']:.4f} s  |  nodes: {fd['n_nodes']}  ("
+                            + "  ".join(f"L{lv}: {n}" for lv, n in enumerate(fd['n_per_level']))
+                            + ")", position='lower_left', font_size=7, color='white')
+            else:
+                bal, comm, mig = fd[('stats_refine', 'stats_always', 'stats_auto')[p - 1]]
+                pl.add_text(f'bal {bal:.2f}  Σcomm {comm}  Σmig {mig}',
+                            position='lower_left', font_size=7, color='white')
+            if first:
+                pl.view_isometric()
+        first = False
+        png = cfg['tmpdir'] + f'/f{idx:06d}.png'
+        pl.screenshot(png)
+        out.append((idx, png))
+
+    pl.close()
+    return out
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__,
@@ -559,6 +485,12 @@ def main():
     parser.add_argument('--distance',   default='1:10')
     parser.add_argument('--save',       default='amrex_compare.mp4')
     parser.add_argument('--fps',        type=int, default=30)
+    parser.add_argument('--play-fps', type=float, default=None,
+                        help='video frame rate (default: play in simulation time)')
+    parser.add_argument('--render3d', action='store_true',
+                        help='render 3D isosurface views instead of 2D mid-plane slices')
+    parser.add_argument('--var', default=None,
+                        help='plotfile variable to show (default: first component)')
     parser.add_argument('--amrex-binary', default=_default_binary,
                         help='AMReX advection binary (for auto-run)')
     parser.add_argument('--inputs', default=None,
@@ -589,6 +521,8 @@ def main():
         os.makedirs(args.plt_dir, exist_ok=True)
         print(f'No plotfiles found — running simulation: {os.path.basename(inputs)}')
         cmd = [args.mpirun, '-n', str(args.mpi_np), binary, inputs]
+        if args.mpi_np <= 0:  # serial (non-MPI) build
+            cmd = [binary, inputs]
         result = subprocess.run(cmd, cwd=os.path.normpath(
             os.path.join(os.path.dirname(__file__), '../..')))
         if result.returncode != 0:
@@ -598,97 +532,25 @@ def main():
         if not plotdirs:
             print(f'Simulation ran but no plotfiles found in {args.plt_dir}'); return
 
-    # read simulation times
-    times = []
-    for pd in plotdirs:
-        try:
-            with open(os.path.join(pd, 'Header')) as f:
-                hlines = f.readlines()
-            nvar = int(hlines[1].strip())
-            times.append(float(hlines[2 + nvar + 1].strip()))
-        except Exception:
-            times.append(0.0)
+    # every plotfile gets a partition; only a sample of them is rendered
+    all_plotdirs = plotdirs
+    all_times = [read_time(pd) for pd in all_plotdirs]
+    shown = select_frames(all_times, args.fps)
+    shown_set = set(shown)
+    times = [all_times[i] for i in shown]
 
-    # subsample to target fps
-    t_max, t_min = max(times), min(times)
-    n_target = int((t_max - t_min) * args.fps) + 1
-    if len(plotdirs) > n_target:
-        ta = np.array(times)
-        targets = np.linspace(t_min, t_max, n_target)
-        selected_indices = sorted(set(int(np.argmin(np.abs(ta - t))) for t in targets))
-        plotdirs = [plotdirs[i] for i in selected_indices]
-        times    = [times[i]    for i in selected_indices]
-    else:
-        selected_indices = list(range(len(plotdirs)))
+    print(f'{len(all_plotdirs)} plotfiles, {len(shown)} of them rendered.')
 
-    print(f'{len(plotdirs)} frames to process.')
-
-    # domain from first frame
-    r0_first = read_level_raw(plotdirs[0], 0)
-    _, _, x0_d, y0_d, dx0, dy0 = r0_first
-    ny0, nx0 = r0_first[0].shape
-    domain = (x0_d, x0_d + nx0 * dx0, y0_d, y0_d + ny0 * dy0)
+    # common image resolution (finest level over the whole run) and domain
+    shape  = finest_shape(all_plotdirs)
+    hdr0   = read_plotfile(all_plotdirs[0], None, args.var)['hdr']
+    if args.render3d and hdr0['ndim'] != 3:
+        print('--render3d needs 3D plotfiles'); return
+    domain = finest_domain(hdr0)
+    var    = hdr0['varnames'][var_index(hdr0, args.var)]
     threads = min(4, mp.cpu_count())
 
-    # ── phase 1: read all frames + build graphs ────────────────────────────────
-
-    print('Phase 1: reading frames...')
-
-    all_phi    = []
-    frame_data = []
-
-    for i, (pd, t) in enumerate(zip(plotdirs, times)):
-        print(f'\r  {i + 1}/{len(plotdirs)}', end='', flush=True)
-
-        r0 = read_level_raw(pd, 0)
-        r1 = read_level_raw(pd, 1)
-        if r0 is None:
-            continue
-
-        grid0, boxes0, *_ = r0
-        l1_mask = np.zeros((ny0, nx0), dtype=bool)
-        grid1 = None
-
-        if r1 is not None:
-            grid1, boxes1, *_ = r1
-            for (lo_x, lo_y, hi_x, hi_y) in boxes1:
-                l1_mask[lo_y // 2:hi_y // 2 + 1, lo_x // 2:hi_x // 2 + 1] = True
-
-        _, nodes, edges, l0_node, l1_node = build_composite_graph(
-            nx0, ny0, l1_mask)
-
-        # phi source
-        if grid1 is not None:
-            phi_src = grid1
-        else:
-            phi_src = np.repeat(np.repeat(grid0, 2, axis=0), 2, axis=1)
-        all_phi.append(phi_src.ravel())
-
-        n_l0 = sum(1 for lv, _, _ in nodes if lv == 0)
-        n_l1 = sum(1 for lv, _, _ in nodes if lv == 1)
-
-        frame_data.append({
-            'coarse':  (grid0,) + tuple(r0[2:]),
-            'fine':    (grid1,) + tuple(r1[2:]) if r1 else None,
-            'nodes':   nodes,
-            'edges':   edges,
-            'n_nodes': len(nodes),
-            'n_l0':    n_l0,
-            'n_l1':    n_l1,
-            'time':    t,
-        })
-
-    print(f'\n  {len(frame_data)} frames read.')
-
-    if not frame_data:
-        print('No valid frames.'); return
-
-    flat    = np.concatenate(all_phi)
-    phi_min = float(np.percentile(flat, 2))
-    phi_max = float(np.percentile(flat, 98))
-    phi_max = max(phi_max, phi_min + 1e-6)
-
-    # ── phase 2: three Dyn-HeiProMap processes (with partition cache) ─────────
+    # ── phase 1+2: read every plotfile, partition it, accumulate statistics ───
 
     methods = {
         'refine': {'label': 'refine-fast',        'cmd': 'autorefine 101 fast'},
@@ -697,125 +559,109 @@ def main():
     }
 
     cdir = cache_dir_for(args.plt_dir)
-    cached = load_partition_cache(cdir, args.dynheipromap,
-                                  args.hierarchy, args.distance,
-                                  args.fps, selected_indices, methods)
+    meta = cache_meta(args.dynheipromap, args.hierarchy, args.distance,
+                      methods, len(all_plotdirs))
+    cached = cache_is_valid(cdir, meta)
 
-    if cached is not None:
-        print(f'Phase 2: loading cached partitions from {cdir}')
-        raw_parts = cached
+    dyns = None
+    if cached:
+        print(f'Partitions: loading cached partitions from {cdir}')
     else:
-        print('Phase 2: Dyn-HeiProMap (refine-fast + always repartition + autorefine 30)...')
+        print('Partitions: Dyn-HeiProMap (refine-fast + always repartition + autorefine 30)...')
+        reset_cache(cdir)
+        dyns = [DynHeiProMap(args.dynheipromap, args.hierarchy, args.distance, threads)
+                for _ in range(3)]
 
-        dyn_refine = DynHeiProMap(args.dynheipromap,
-                                  args.hierarchy, args.distance, threads)
-        dyn_always = DynHeiProMap(args.dynheipromap,
-                                  args.hierarchy, args.distance, threads)
-        dyn_auto   = DynHeiProMap(args.dynheipromap,
-                                  args.hierarchy, args.distance, threads)
-
-        fd0 = frame_data[0]
-        dyn_refine.load_graph(fd0['nodes'], fd0['edges'])
-        dyn_always.load_graph(fd0['nodes'], fd0['edges'])
-        dyn_auto.load_graph(fd0['nodes'], fd0['edges'])
-
-        raw_parts = []
-        try:
-            for i, fd in enumerate(frame_data):
-                print(f'\r  {i + 1}/{len(frame_data)}', end='', flush=True)
-                nodes = fd['nodes']
-                edges = fd['edges']
-
-                if i == 0:
-                    t0 = time.perf_counter()
-                    dyn_refine.partition('fast')
-                    pr = dyn_refine.get_partition(nodes)
-                    ms_r = (time.perf_counter() - t0) * 1e3
-
-                    t0 = time.perf_counter()
-                    dyn_always.partition('fast')
-                    pa = dyn_always.get_partition(nodes)
-                    ms_a = (time.perf_counter() - t0) * 1e3
-
-                    t0 = time.perf_counter()
-                    dyn_auto.partition('fast')
-                    pu = dyn_auto.get_partition(nodes)
-                    ms_u = (time.perf_counter() - t0) * 1e3
-                else:
-                    prev = frame_data[i - 1]
-                    dyn_refine.apply_diff(prev['nodes'], prev['edges'], nodes, edges)
-                    dyn_always.apply_diff(prev['nodes'], prev['edges'], nodes, edges)
-                    dyn_auto.apply_diff(prev['nodes'], prev['edges'], nodes, edges)
-
-                    t0 = time.perf_counter()
-                    dyn_refine.autorefine(101, 'fast')
-                    pr = dyn_refine.get_partition(nodes)
-                    ms_r = (time.perf_counter() - t0) * 1e3
-
-                    t0 = time.perf_counter()
-                    dyn_always.partition('fast')
-                    pa = dyn_always.get_partition(nodes)
-                    ms_a = (time.perf_counter() - t0) * 1e3
-
-                    t0 = time.perf_counter()
-                    dyn_auto.autorefine(30, 'fast')
-                    pu = dyn_auto.get_partition(nodes)
-                    ms_u = (time.perf_counter() - t0) * 1e3
-
-                raw_parts.append((pr, pa, pu, ms_r, ms_a, ms_u))
-        finally:
-            dyn_refine.close()
-            dyn_always.close()
-            dyn_auto.close()
-
-        print(f'\n  saving partitions to {cdir}')
-        save_partition_cache(cdir, args.dynheipromap,
-                             args.hierarchy, args.distance,
-                             args.fps, selected_indices, methods, raw_parts)
-
-    # compute stats + build frame list
-    prev_map_refine, prev_map_always, prev_map_auto = {}, {}, {}
-    acc_comm_r = acc_mig_r = 0
-    acc_comm_a = acc_mig_a = 0
-    acc_comm_u = acc_mig_u = 0
-
-    frames = []
+    prev_maps = [{}, {}, {}]          # per method: previous partition of each cell
+    acc_comm = [0, 0, 0]              # cumulative over ALL plotfiles
+    acc_mig  = [0, 0, 0]
+    all_phi    = []
+    frames     = []
     table_rows = []
-    for i, (fd, (part_refine, part_always, part_auto, ms_r, ms_a, ms_u)) in enumerate(
-            zip(frame_data, raw_parts)):
-        nodes = fd['nodes']
-        edges = fd['edges']
+    prev_graph = None
 
-        bal_r, comm_r, mig_r = partition_stats(nodes, edges, part_refine, k, prev_map_refine)
-        bal_a, comm_a, mig_a = partition_stats(nodes, edges, part_always, k, prev_map_always)
-        bal_u, comm_u, mig_u = partition_stats(nodes, edges, part_auto,   k, prev_map_auto)
+    try:
+        for i, pd in enumerate(all_plotdirs):
+            print(f'\r  {i + 1}/{len(all_plotdirs)}', end='', flush=True)
+            render = i in shown_set
 
-        acc_comm_r += comm_r; acc_mig_r += mig_r
-        acc_comm_a += comm_a; acc_mig_a += mig_a
-        acc_comm_u += comm_u; acc_mig_u += mig_u
+            pf = read_plotfile(pd, shape, args.var, volume=args.render3d and render)
+            nodes, edges, leaf = build_composite_graph(
+                pf['grids'], pf['hdr']['ratios'], shape=shape)
+            t = all_times[i]
 
-        frames.append({
-            'coarse':       fd['coarse'],
-            'fine':         fd['fine'],
-            'part_refine':  partition_image(nodes, part_refine, ny0, nx0),
-            'part_always':  partition_image(nodes, part_always, ny0, nx0),
-            'part_auto':    partition_image(nodes, part_auto,   ny0, nx0),
-            'stats_refine': (bal_r, acc_comm_r, acc_mig_r),
-            'stats_always': (bal_a, acc_comm_a, acc_mig_a),
-            'stats_auto':   (bal_u, acc_comm_u, acc_mig_u),
-            'n_nodes':      fd['n_nodes'],
-            'n_l0':         fd['n_l0'],
-            'n_l1':         fd['n_l1'],
-            'time':         fd['time'],
-        })
-        table_rows.append((
-            i, fd['time'], fd['n_nodes'],
-            bal_r, acc_comm_r, acc_mig_r, ms_r,
-            bal_a, acc_comm_a, acc_mig_a, ms_a,
-            bal_u, acc_comm_u, acc_mig_u, ms_u,
-        ))
+            if cached:
+                parts, ms = load_frame(cdir, i)
+            else:
+                if i == 0:
+                    for d in dyns:
+                        d.load_graph(nodes, edges)
+                else:
+                    for d in dyns:
+                        d.apply_diff(prev_graph[0], prev_graph[1], nodes, edges)
+                parts, ms = [], []
+                for d, cmd in zip(dyns, (('autorefine', 101), ('partition', None),
+                                         ('autorefine', 30))):
+                    t0 = time.perf_counter()
+                    if i == 0 or cmd[0] == 'partition':
+                        d.partition('fast')
+                    else:
+                        d.autorefine(cmd[1], 'fast')
+                    parts.append(d.get_partition(nodes))
+                    ms.append((time.perf_counter() - t0) * 1e3)
+                save_frame(cdir, i, parts, ms, nodes, t)
 
-    print(f'\n  {len(frames)} frames with all partitions.')
+            stats = [partition_stats(nodes, edges, parts[m], k, prev_maps[m])
+                     for m in range(3)]
+            for m in range(3):
+                acc_comm[m] += stats[m][1]
+                acc_mig[m]  += stats[m][2]
+
+            n_per_level = [0] * pf['hdr']['nlev']
+            for cell in nodes:
+                n_per_level[cell[0]] += 1
+
+            table_rows.append((
+                i, t, len(nodes),
+                stats[0][0], acc_comm[0], acc_mig[0], ms[0],
+                stats[1][0], acc_comm[1], acc_mig[1], ms[1],
+                stats[2][0], acc_comm[2], acc_mig[2], ms[2],
+            ))
+
+            if render:
+                all_phi.append((pf['vol'] if args.render3d else pf['phi']).ravel())
+                leaf2d = slice_2d(leaf)
+                frames.append({
+                    'phi':          pf['phi'],
+                    'part_refine':  partition_image(leaf2d, parts[0]),
+                    'part_always':  partition_image(leaf2d, parts[1]),
+                    'part_auto':    partition_image(leaf2d, parts[2]),
+                    'stats_refine': (stats[0][0], acc_comm[0], acc_mig[0]),
+                    'stats_always': (stats[1][0], acc_comm[1], acc_mig[1]),
+                    'stats_auto':   (stats[2][0], acc_comm[2], acc_mig[2]),
+                    'n_nodes':      len(nodes),
+                    'n_per_level':  n_per_level,
+                    'time':         t,
+                })
+                if args.render3d:
+                    frames[-1]['vol'] = pf['vol']
+                    for key, part in zip(('refine', 'always', 'auto'), parts):
+                        frames[-1][f'part3d_{key}'] = np.asarray(part, dtype=np.int8)[leaf]
+            prev_graph = (nodes, edges)
+    finally:
+        if dyns:
+            for d in dyns:
+                d.close()
+
+    if not cached:
+        finish_cache(cdir, meta)
+        print(f'\n  partitions of all {len(all_plotdirs)} plotfiles saved to {cdir}')
+    print(f'\n  {len(table_rows)} plotfiles partitioned, {len(frames)} frames to render.')
+
+    flat    = np.concatenate(all_phi)
+    phi_min = float(np.percentile(flat, 2))
+    phi_max = float(np.percentile(flat, 98))
+    phi_max = max(phi_max, phi_min + 1e-6)
 
     # ── phase 3: render ────────────────────────────────────────────────────────
 
@@ -825,16 +671,16 @@ def main():
         'figsize': (14, 12),
         'dpi':     100,
         'k':       k,
+        'var':     var,
+        'domain3d': (hdr0['prob_lo'], hdr0['prob_hi']),
+        'shape3d':  shape,
+        'win3d':    (1400, 1200),
     }
-
-    import imageio, imageio.v2 as iio2
-    ext  = os.path.splitext(args.save)[1].lower()
-    extra = {'loop': 0} if ext == '.gif' else {
-        'codec': 'libx264', 'macro_block_size': 1,
-        'output_params': ['-vf', 'crop=trunc(iw/2)*2:trunc(ih/2)*2,format=yuv420p']}
 
     n        = len(frames)
     n_workers = max(1, mp.cpu_count() - 1)
+    if args.render3d:
+        n_workers = min(n_workers, 8)  # one EGL context per process
     chunk    = max(1, n // n_workers)
     batches  = [list(range(j, min(j + chunk, n))) for j in range(0, n, chunk)]
 
@@ -845,7 +691,8 @@ def main():
         png_map = {}
         done = 0
         with mp.Pool(n_workers) as pool:
-            for result in pool.imap_unordered(_render_worker, work):
+            for result in pool.imap_unordered(
+                    _render_worker_3d if args.render3d else _render_worker, work):
                 for idx, png in result:
                     png_map[idx] = png
                 done += len(result)
@@ -854,9 +701,8 @@ def main():
                 print(f'\r  [{bar}] {pct:3d}%  {done}/{n}', end='', flush=True)
         print()
         print('Assembling...')
-        with imageio.get_writer(args.save, fps=args.fps, **extra) as writer:
-            for j in range(n):
-                writer.append_data(iio2.imread(png_map[j]))
+        assemble_video(tmpdir, args.save,
+                       args.play_fps or playback_fps(times, args.fps))
     print(f'Saved → {args.save}')
 
     # ── per-frame table ─────────────────────────────────────────────────────────
@@ -876,33 +722,35 @@ def main():
                 for _ in meth))
     sep  = '-' * len(hdr2)
 
-    print()
-    print(hdr1)
-    print(hdr2)
-    print(sep)
+    lines = [hdr1, hdr2, sep]
     for (frm, t, nd,
          br, cr, mr, tr,
          ba, ca, ma, ta,
          bu, cu, mu, tu) in table_rows:
-        print(
+        lines.append(
             f"{frm:>{C['frm']}}  {t:>{C['t']}.4f}  {nd:>{C['nd']}}  "
             f"{br:>{C['bal']}.2f}  {cr:>{C['Sco']}}  {mr:>{C['Smi']}}  {tr:>{C['ms']}.1f}  "
             f"{ba:>{C['bal']}.2f}  {ca:>{C['Sco']}}  {ma:>{C['Smi']}}  {ta:>{C['ms']}.1f}  "
             f"{bu:>{C['bal']}.2f}  {cu:>{C['Sco']}}  {mu:>{C['Smi']}}  {tu:>{C['ms']}.1f}"
         )
-    print(sep)
+    lines.append(sep)
     cr_f, mr_f = table_rows[-1][4], table_rows[-1][5]
     ca_f, ma_f = table_rows[-1][8], table_rows[-1][9]
     cu_f, mu_f = table_rows[-1][12], table_rows[-1][13]
     ms_r_tot = sum(r[6]  for r in table_rows)
     ms_a_tot = sum(r[10] for r in table_rows)
     ms_u_tot = sum(r[14] for r in table_rows)
-    print(
+    lines.append(
         f"{'TOT':>{C['frm']}}  {'':>{C['t']}}  {'':>{C['nd']}}  "
         f"{'':>{C['bal']}}  {cr_f:>{C['Sco']}}  {mr_f:>{C['Smi']}}  {ms_r_tot:>{C['ms']}.1f}  "
         f"{'':>{C['bal']}}  {ca_f:>{C['Sco']}}  {ma_f:>{C['Smi']}}  {ms_a_tot:>{C['ms']}.1f}  "
         f"{'':>{C['bal']}}  {cu_f:>{C['Sco']}}  {mu_f:>{C['Smi']}}  {ms_u_tot:>{C['ms']}.1f}"
     )
+    stats_path = os.path.splitext(args.save)[0] + '_stats.txt'
+    with open(stats_path, 'w') as f:
+        f.write('\n'.join(lines) + '\n')
+    print(f'\nPer-plotfile statistics ({len(table_rows)} plotfiles) → {stats_path}')
+    print(lines[-1])
 
     # ── compact summary ────────────────────────────────────────────────────────
 

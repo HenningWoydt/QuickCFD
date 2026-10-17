@@ -1,6 +1,6 @@
 # Todo
 
-## Runtime-selectable velocity field
+## [DONE] Runtime-selectable velocity field
 
 Currently the velocity field (deformational / rotating / vortex) is compiled into the binary via `face_velocity.H`. Switching simulations requires modifying the header and recompiling, which means all three `amr/inputs/` files share one binary that only implements one flow at a time.
 
@@ -24,3 +24,10 @@ Currently the velocity field (deformational / rotating / vortex) is compiled int
 - `extern/amrex/Tests/Amr/Advection_AmrCore/Source/AmrCoreAdv.H`
 - `extern/amrex/Tests/Amr/Advection_AmrCore/Source/AmrCoreAdv.cpp` (ReadParameters)
 - `amr/inputs/advection_periodic`, `advection_rotating`, `advection_vortex`
+
+**Status:** all six steps implemented and built. `advection_periodic` (0), `advection_rotating` (1) and
+`advection_vortex` (2) now run from the same binary. Verified by running the rotating and vortex inputs
+(different refined-cell counts, 7552 vs 13504 nodes at the last frame).
+
+**Caveat:** the changes live in `extern/amrex/`, which is gitignored, so they are not tracked here.
+Keep them as a patch or a fork of AMReX if they need to survive a re-clone.

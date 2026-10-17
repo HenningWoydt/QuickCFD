@@ -1,6 +1,6 @@
 # Known Bugs
 
-## [OPEN] Dyn-HeiProMap: partition file too short after repeated vertex additions/removals
+## [RESOLVED] Dyn-HeiProMap: partition file too short after repeated vertex additions/removals
 
 **Affects:** `amrex_dynmap_video.py` phase 2 — long simulations with dynamic AMR (e.g. `advection_vortex`)
 
@@ -19,3 +19,8 @@ The partition file format specifies one entry per vertex ID (0-based), with inac
 
 **Fix needed in Dyn-HeiProMap:**
 `save-partition` must write entries for all IDs 0 … max_id (inclusive), padding removed/inactive vertices with 0, so the file length equals the total number of IDs ever assigned.
+
+**Resolution:** not reproducible with the current Dyn-HeiProMap build (HeiProMap master, 8561897).
+`dyn_graph.h` keeps `n = max_id + 1` and never shrinks it on `-v`, and `save-partition` writes `g.n`
+entries, so the file length always covers every assigned ID. The full `advection_vortex` run
+(601 frames) and `advection_rotating` now finish without the `IndexError`.

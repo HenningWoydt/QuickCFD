@@ -1,0 +1,40 @@
+# Rayleigh-Taylor instability (compressible Euler with gravity, GPU/CNS test), 3D.
+# A heavy fluid sits on a light one with an axisymmetric perturbation; the refined
+# region is the growing interface sheet, which wrinkles and spreads as the mixing layer grows.
+max_step  = 100000
+stop_time = 20.0
+
+geometry.is_periodic = 1 1 0
+geometry.coord_sys   = 0
+geometry.prob_lo     =   0.0     0.0     0.0
+geometry.prob_hi     =   0.5     0.5     1.0
+amr.n_cell           =   16      16      32
+
+cns.lo_bc       =  0   0   4
+cns.hi_bc       =  0   0   4
+
+cns.gravity = -1.0
+cns.eos_gamma = 1.6666666666
+cns.do_visc = false
+cns.cfl = 0.3
+
+cns.refine_max_dengrad_lev = 10
+cns.refine_dengrad = 0.05
+
+cns.v = 1
+amr.v = 1
+
+amr.max_level       = 2
+amr.ref_ratio       = 2 2 2 2
+amr.regrid_int      = 2 2 2 2
+amr.blocking_factor = 4
+amr.max_grid_size   = 32
+amr.n_error_buf     = 1 1 1 1
+amr.grid_eff        = 0.7
+
+amr.checkpoint_files_output = 0
+
+amr.plot_files_output = 1
+amr.plot_file         = amr/plotfiles/cns_rt/plt
+amr.plot_int          = 50      # about 190 plotfiles over the run
+amr.derive_plot_vars  = pressure
