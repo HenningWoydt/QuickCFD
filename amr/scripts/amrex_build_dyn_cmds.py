@@ -1,13 +1,15 @@
 #!/usr/bin/env python3
 """
 Write the Dyn-HeiProMap command files that recreate how the graph of an AMReX run
-changes over time: one file per plotfile (every plotfile, not a sample).
+changes over time: one file per plotfile whose graph differs from the previous one
+(plotfiles with an unchanged graph have no file; the number in the file name is the
+plotfile index, so gaps are plotfiles where nothing changed).
 
 For each run, into amr/dyn_heipromap_cmds/<run>/ (gitignored, regenerate with this script):
   frame_000000.my_seq   builds the graph of the first plotfile (+v / +e)
   frame_000001.my_seq   changes that turn the graph of plotfile 0 into plotfile 1
   ...                   (-e, -v, +v, +e), one file per following plotfile
-  frames.csv            frame, plotfile, time, vertices, edges (after the frame)
+  frames.csv            frame, plotfile, time, vertices, edges, changed (1 if it has a file)
   vertices.csv          vertex id -> cell (level, index), first and last frame it exists
 
 Executing frame_000000.my_seq, frame_000001.my_seq, ... in order in Dyn-HeiProMap
@@ -53,7 +55,8 @@ def build_run(job):
     reg = IdRegistry()
     first, last, cell_of = {}, {}, {}     # per vertex id
     prev = None
-    frames_csv = ['frame,plotfile,time,vertices,edges']
+    frames_csv = ['frame,plotfile,time,vertices,edges,changed']
+    n_files = 0
 
     for i, pd in enumerate(plotdirs):
         pf = read_plotfile(pd, shape)
@@ -62,6 +65,10 @@ def build_run(job):
 
         before = reg.next_id
         cmds = reg.initial(nodes, edges) if prev is None else reg.diff(*prev, nodes, edges)
+        prev = (nodes, edges)
+        if not cmds:      # graph unchanged since the previous plotfile
+            frames_csv.append(f'{i},{os.path.basename(pd)},{t:.10g},{len(nodes)},{len(edges)},0')
+            continue
         for cell, vid in reg.cell_to_id.items():
             if vid >= before:
                 first[vid] = i
@@ -79,8 +86,8 @@ def build_run(job):
             f.write(f'# +{n_add_v} -{n_del_v} vertices, +{n_add_e} -{n_del_e} edges'
                     f'  ->  {len(nodes)} vertices, {len(edges)} edges\n')
             f.write('\n'.join(cmds) + '\n')
-        frames_csv.append(f'{i},{os.path.basename(pd)},{t:.10g},{len(nodes)},{len(edges)}')
-        prev = (nodes, edges)
+        frames_csv.append(f'{i},{os.path.basename(pd)},{t:.10g},{len(nodes)},{len(edges)},1')
+        n_files += 1
 
     with open(os.path.join(out_dir, 'frames.csv'), 'w') as f:
         f.write('\n'.join(frames_csv) + '\n')
@@ -92,7 +99,7 @@ def build_run(job):
             cell = cell_of[vid]
             f.write(f'{vid},{cell[0]},' + ','.join(str(v) for v in cell[1:])
                     + f',{first[vid]},{last.get(vid, len(plotdirs) - 1)}\n')
-    return (f'{name}: {len(plotdirs)} frames, {reg.next_id} vertex ids '
+    return (f'{name}: {n_files} command files for {len(plotdirs)} plotfiles, {reg.next_id} vertex ids '
             f'→ {os.path.relpath(out_dir, os.path.dirname(AMR_DIR))}')
 
 

@@ -73,10 +73,12 @@ def cache_meta(binary, hierarchy, distance, methods, n_plotfiles):
         'methods':       methods,
         'n_plotfiles':   n_plotfiles,
         'graph_version': GRAPH_VERSION,
+        'skip_unchanged': True,   # plotfiles whose graph did not change are not partitioned
     }
 
 
-# One file per plotfile (every plotfile, not only the frames shown in the video):
+# One file per plotfile whose graph changed (plotfile 0 and every plotfile whose graph
+# differs from the previous one; the others keep the previous partition and are not stored):
 #   refine / always / auto  rank of every node for the three strategies
 #   nodes                   (level, *index) of every node, in the same order
 #   time                    simulation time
@@ -90,9 +92,11 @@ def cache_is_valid(cache_dir, meta):
     if not os.path.exists(meta_path):
         return False
     with open(meta_path) as f:
-        if json.load(f) != meta:
-            return False
-    return len(glob.glob(os.path.join(cache_dir, 'frame_*.npz'))) == meta['n_plotfiles']
+        stored = json.load(f)
+    n_stored = stored.pop('n_stored', None)
+    if n_stored is None or stored != meta:
+        return False
+    return len(glob.glob(os.path.join(cache_dir, 'frame_*.npz'))) == n_stored
 
 
 def reset_cache(cache_dir):
@@ -119,16 +123,20 @@ def save_frame(cache_dir, i, parts, ms, nodes, t):
 
 
 def load_frame(cache_dir, i):
+    """Partitions and timings of plotfile i, or None if its graph did not change
+    (such plotfiles are not stored; they keep the previous partition)."""
+    if not os.path.exists(frame_path(cache_dir, i)):
+        return None
     d = np.load(frame_path(cache_dir, i))
     parts = (d['refine'].tolist(), d['always'].tolist(), d['auto'].tolist())
     ms = (float(d['ms_refine']), float(d['ms_always']), float(d['ms_auto']))
     return parts, ms
 
 
-def finish_cache(cache_dir, meta):
+def finish_cache(cache_dir, meta, n_stored):
     """Mark the cache complete (written last, so a partial cache is never valid)."""
     with open(os.path.join(cache_dir, 'meta.json'), 'w') as f:
-        json.dump(meta, f, indent=2)
+        json.dump({**meta, 'n_stored': n_stored}, f, indent=2)
 
 
 def cell_key(*cell):
@@ -210,8 +218,10 @@ class DynHeiProMap:
 
     def apply_diff(self, prev_nodes, prev_edges, curr_nodes, curr_edges):
         """Compute and send the graph diff between two consecutive frames."""
-        for c in self._ids.diff(prev_nodes, prev_edges, curr_nodes, curr_edges):
+        cmds = self._ids.diff(prev_nodes, prev_edges, curr_nodes, curr_edges)
+        for c in cmds:
             self._send(c)
+        return len(cmds)
 
     def partition(self, config='fast'):
         self._send(f'partition {config}')
@@ -539,6 +549,8 @@ def main():
     frames     = []
     table_rows = []
     prev_graph = None
+    prev_parts = None
+    n_stored   = 0          # plotfiles whose graph changed (the only ones partitioned)
 
     try:
         for i, pd in enumerate(all_plotdirs):
@@ -551,25 +563,35 @@ def main():
             t = all_times[i]
 
             if cached:
-                parts, ms = load_frame(cdir, i)
+                got = load_frame(cdir, i)
+                changed = got is not None
+                parts, ms = got if changed else (prev_parts, (0.0, 0.0, 0.0))
             else:
                 if i == 0:
                     for d in dyns:
                         d.load_graph(nodes, edges)
+                    changed = True
                 else:
-                    for d in dyns:
-                        d.apply_diff(prev_graph[0], prev_graph[1], nodes, edges)
-                parts, ms = [], []
-                for d, cmd in zip(dyns, (('autorefine', 101), ('partition', None),
-                                         ('autorefine', 30))):
-                    t0 = time.perf_counter()
-                    if i == 0 or cmd[0] == 'partition':
-                        d.partition('fast')
-                    else:
-                        d.autorefine(cmd[1], 'fast')
-                    parts.append(d.get_partition(nodes))
-                    ms.append((time.perf_counter() - t0) * 1e3)
-                save_frame(cdir, i, parts, ms, nodes, t)
+                    n_cmds = [d.apply_diff(prev_graph[0], prev_graph[1], nodes, edges)
+                              for d in dyns]
+                    changed = n_cmds[0] > 0
+                if changed:
+                    parts, ms = [], []
+                    for d, cmd in zip(dyns, (('autorefine', 101), ('partition', None),
+                                             ('autorefine', 30))):
+                        t0 = time.perf_counter()
+                        if i == 0 or cmd[0] == 'partition':
+                            d.partition('fast')
+                        else:
+                            d.autorefine(cmd[1], 'fast')
+                        parts.append(d.get_partition(nodes))
+                        ms.append((time.perf_counter() - t0) * 1e3)
+                    save_frame(cdir, i, parts, ms, nodes, t)
+                    n_stored += 1
+                else:
+                    # graph unchanged: nothing to repartition, keep the last partition
+                    parts, ms = prev_parts, (0.0, 0.0, 0.0)
+            prev_parts = parts
 
             stats = [partition_stats(nodes, edges, parts[m], k, prev_maps[m])
                      for m in range(3)]
@@ -614,9 +636,10 @@ def main():
                 d.close()
 
     if not cached:
-        finish_cache(cdir, meta)
-        print(f'\n  partitions of all {len(all_plotdirs)} plotfiles saved to {cdir}')
-    print(f'\n  {len(table_rows)} plotfiles partitioned, {len(frames)} frames to render.')
+        finish_cache(cdir, meta, n_stored)
+        print(f'\n  partitions of the {n_stored} plotfiles whose graph changed '
+              f'(of {len(all_plotdirs)}) saved to {cdir}')
+    print(f'\n  {len(table_rows)} plotfiles, {len(frames)} frames to render.')
 
     flat    = np.concatenate(all_phi)
     phi_min = float(np.percentile(flat, 2))
