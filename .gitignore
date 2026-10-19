@@ -52,5 +52,6 @@ splish_output/
 amr/plotfiles/*/
 amr/results/
 amr/partitions/
+amr/dyn_heipromap_cmds/
 amr/plotfiles/
 amr/Backtrace.*

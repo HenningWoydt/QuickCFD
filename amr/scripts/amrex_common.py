@@ -271,6 +271,71 @@ def nodes_edges_to_metis(nodes, edges):
     return lines
 
 
+# ── Dyn-HeiProMap vertex ids and graph commands ──────────────────────────────
+
+class IdRegistry:
+    """Vertex ids for Dyn-HeiProMap and the command stream that turns the graph of
+    one plotfile into the next.
+
+    Ids are assigned to cells in the order they first appear (0, 1, 2, ...) and never
+    reused after a cell disappears.  initial() / diff() return the commands
+    (strings, one per line) that Dyn-HeiProMap executes: "+v id weight",
+    "-v id", "+e u v weight", "-e u v".
+    """
+
+    def __init__(self):
+        self.cell_to_id = {}   # (level, *index) -> vertex id
+        self.next_id = 0
+
+    def initial(self, nodes, edges):
+        """Commands that build the first graph; ids 0..N-1 follow the node order."""
+        cmds = []
+        for i, cell in enumerate(nodes):
+            self.cell_to_id[tuple(cell)] = i
+            self.next_id = i + 1
+            cmds.append(f'+v {i} 1')
+        for u, v in edges:
+            cmds.append(f'+e {u} {v} 1')
+        return cmds
+
+    def diff(self, prev_nodes, prev_edges, curr_nodes, curr_edges):
+        """Commands that turn the previous graph into the current one."""
+        prev_set = {tuple(cell) for cell in prev_nodes}
+        curr_set = {tuple(cell) for cell in curr_nodes}
+
+        prev_local_to_id = {i: self.cell_to_id[tuple(cell)]
+                            for i, cell in enumerate(prev_nodes)}
+        prev_edge_ids = set()
+        for u, v in prev_edges:
+            eu, ev = prev_local_to_id[u], prev_local_to_id[v]
+            prev_edge_ids.add((min(eu, ev), max(eu, ev)))
+
+        # assign ids to new cells
+        for cell in curr_nodes:
+            k = tuple(cell)
+            if k not in self.cell_to_id:
+                self.cell_to_id[k] = self.next_id
+                self.next_id += 1
+
+        curr_local_to_id = {i: self.cell_to_id[tuple(cell)]
+                            for i, cell in enumerate(curr_nodes)}
+        curr_edge_ids = set()
+        for u, v in curr_edges:
+            eu, ev = curr_local_to_id[u], curr_local_to_id[v]
+            curr_edge_ids.add((min(eu, ev), max(eu, ev)))
+
+        cmds = []
+        for u, v in (prev_edge_ids - curr_edge_ids):
+            cmds.append(f'-e {u} {v}')
+        for cell in prev_set - curr_set:
+            cmds.append(f'-v {self.cell_to_id.pop(cell)}')
+        for cell in curr_set - prev_set:
+            cmds.append(f'+v {self.cell_to_id[cell]} 1')
+        for u, v in (curr_edge_ids - prev_edge_ids):
+            cmds.append(f'+e {u} {v} 1')
+        return cmds
+
+
 # ── video helpers ────────────────────────────────────────────────────────────
 
 def playback_fps(times, fps):

@@ -42,7 +42,8 @@ from matplotlib.colors import Normalize, BoundaryNorm
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from amrex_common import (GRAPH_VERSION, read_plotfile, read_time, finest_shape,
                           finest_domain, build_composite_graph, partition_image, slice_2d,
-                          select_frames, playback_fps, assemble_video, var_index)
+                          select_frames, playback_fps, assemble_video, var_index,
+                          IdRegistry)
 
 
 # ── partition cache ───────────────────────────────────────────────────────────
@@ -184,8 +185,8 @@ class DynHeiProMap:
             cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL, text=True, bufsize=1)
         self._seq        = 0            # partition file counter
-        self._next_id    = 0            # next free vertex id (never reused)
-        self._cell_to_id = {}           # cell_key → dyn vertex id
+        self._ids        = IdRegistry() # cell → vertex id (ids are never reused)
+        self._cell_to_id = self._ids.cell_to_id
         self._saved_q    = queue.Queue()  # paths confirmed written by binary
         self._reader     = threading.Thread(target=self._drain_stdout, daemon=True)
         self._reader.start()
@@ -204,53 +205,12 @@ class DynHeiProMap:
         """Load initial graph via exec file. Assigns IDs 0..N-1 in node order."""
         seq_path = os.path.join(self._tmpdir, 'init.my_seq')
         with open(seq_path, 'w') as f:
-            for i, cell in enumerate(nodes):
-                self._cell_to_id[cell_key(*cell)] = i
-                self._next_id = i + 1
-                f.write(f'+v {i} 1\n')
-            for u, v in edges:
-                f.write(f'+e {u} {v} 1\n')
+            f.write('\n'.join(self._ids.initial(nodes, edges)) + '\n')
         self._send(f'exec {seq_path}')
 
     def apply_diff(self, prev_nodes, prev_edges, curr_nodes, curr_edges):
         """Compute and send the graph diff between two consecutive frames."""
-        prev_set = {cell_key(*cell) for cell in prev_nodes}
-        curr_set = {cell_key(*cell) for cell in curr_nodes}
-
-        prev_local_to_id = {i: self._cell_to_id[cell_key(*cell)]
-                            for i, cell in enumerate(prev_nodes)}
-        prev_edge_ids = set()
-        for u, v in prev_edges:
-            eu, ev = prev_local_to_id[u], prev_local_to_id[v]
-            prev_edge_ids.add((min(eu, ev), max(eu, ev)))
-
-        # assign IDs to new cells
-        for cell in curr_nodes:
-            k = cell_key(*cell)
-            if k not in self._cell_to_id:
-                self._cell_to_id[k] = self._next_id
-                self._next_id += 1
-
-        curr_local_to_id = {i: self._cell_to_id[cell_key(*cell)]
-                            for i, cell in enumerate(curr_nodes)}
-        curr_edge_ids = set()
-        for u, v in curr_edges:
-            eu, ev = curr_local_to_id[u], curr_local_to_id[v]
-            curr_edge_ids.add((min(eu, ev), max(eu, ev)))
-
-        cmds = []
-        for u, v in (prev_edge_ids - curr_edge_ids):
-            cmds.append(f'-e {u} {v}')
-        for cell in prev_set - curr_set:
-            vid = self._cell_to_id.pop(cell_key(*cell))
-            cmds.append(f'-v {vid}')
-        for cell in curr_set - prev_set:
-            vid = self._cell_to_id[cell_key(*cell)]
-            cmds.append(f'+v {vid} 1')
-        for u, v in (curr_edge_ids - prev_edge_ids):
-            cmds.append(f'+e {u} {v} 1')
-
-        for c in cmds:
+        for c in self._ids.diff(prev_nodes, prev_edges, curr_nodes, curr_edges):
             self._send(c)
 
     def partition(self, config='fast'):
