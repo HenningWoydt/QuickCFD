@@ -52,4 +52,5 @@ splish_output/
 amr/plotfiles/*/
 amr/results/
 amr/partitions/
+amr/plotfiles/
 amr/Backtrace.*
